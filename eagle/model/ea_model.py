@@ -131,6 +131,11 @@ class EaModel(nn.Module):
             "early_stops": 0,
             "stop_depths": [],
         }
+        if hasattr(self.ea_layer, "last_ddd_debug"):
+            self.ea_layer.last_ddd_debug = None
+
+    def reset_ddd_runtime_metrics(self):
+        self._reset_ddd_runtime_metrics()
 
     def _record_ddd_verify_debug(self):
         debug = getattr(self.ea_layer, "last_ddd_debug", None)
