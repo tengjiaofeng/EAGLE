@@ -676,6 +676,9 @@ class Model(nn.Module):
         total_tokens = self.total_tokens
         depth = self.depth
         top_k = self.top_k
+        controller = getattr(self, "cost_aware_controller", None)
+        if controller is not None:
+            controller.reset_tree()
 
         sample_token = input_ids[:, -1]
 
@@ -703,6 +706,10 @@ class Model(nn.Module):
 
         last_p = self.logsoftmax(last_headout)
         top = torch.topk(last_p, top_k, dim=-1)
+        if controller is not None:
+            cumulative_conf = controller.update_confidence(last_p)
+            if controller.should_stop_drafting(1, cumulative_conf):
+                depth = 0
         topk_index, topk_p = top.indices, top.values
         scores = topk_p[0]
         scores_list.append(scores[None])
@@ -733,6 +740,12 @@ class Model(nn.Module):
             last_p = self.logsoftmax(last_headout)
 
             top = torch.topk(last_p, top_k, dim=-1)
+            stop_after_this_depth = False
+            if controller is not None:
+                current_depth = i + 2
+                cumulative_conf = controller.update_confidence(last_p)
+                if controller.should_stop_drafting(current_depth, cumulative_conf):
+                    stop_after_this_depth = True
             topk_index, topk_p = top.indices, top.values
 
             cu_scores = topk_p + scores[:, None]
@@ -749,11 +762,14 @@ class Model(nn.Module):
             ss_token.append(topk_index)
             scores_list.append(cu_scores)
             tree_mask = torch.cat((tree_mask[:, :, out_ids], self.tree_mask_init), dim=3)
+            if stop_after_this_depth:
+                break
 
 
 
         scores_list = torch.cat(scores_list, dim=0).view(-1)
         ss_token_list = torch.cat(ss_token, dim=0).view(-1)
+        total_tokens = min(total_tokens, scores_list.numel())
         top_scores = torch.topk(scores_list, total_tokens, dim=-1)
         top_scores_index = top_scores.indices
         top_scores_index = torch.sort(top_scores_index).values
@@ -775,6 +791,8 @@ class Model(nn.Module):
 
 
         tree_position_ids = torch.sum(tree_mask, dim=1) - 1
+        if controller is not None:
+            controller.record_draft_depth(int(tree_position_ids.max().item()))
 
         tree_mask = tree_mask.float()[None, None]
         draft_tokens = draft_tokens[None]

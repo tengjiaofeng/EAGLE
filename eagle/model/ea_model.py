@@ -20,6 +20,7 @@ from .kv_cache import initialize_past_key_values
 from .cnets import Model
 from .cnets1 import Model as Model1
 from .configs import EConfig
+from .cost_aware_controller import CostAwareController
 
 
 class EaModel(nn.Module):
@@ -35,6 +36,7 @@ class EaModel(nn.Module):
             top_k,
             threshold,
             ea_layer_state_dict,
+            cost_aware_controller=None,
     ):
 
         super().__init__()
@@ -76,6 +78,7 @@ class EaModel(nn.Module):
         load_=self.ea_layer.load_state_dict(ea_layer_state_dict, strict=False)
         self.ea_layer.to(self.base_model.dtype).to(device)
         self.ea_layer.init_tree()
+        self.ea_layer.cost_aware_controller = cost_aware_controller
 
     def get_tokenizer(self):
         """Get the tokenizer of the base model.
@@ -84,6 +87,42 @@ class EaModel(nn.Module):
             Tokenizer: The tokenizer of the base model.
         """
         return self.tokenizer
+
+    def enable_cost_aware_ddd(self, **kwargs):
+        controller = CostAwareController(**kwargs)
+        self.ea_layer.cost_aware_controller = controller
+        return controller
+
+    def disable_cost_aware_ddd(self):
+        self.ea_layer.cost_aware_controller = None
+
+    def _get_cost_aware_controller(self):
+        return getattr(self.ea_layer, "cost_aware_controller", None)
+
+    def _make_cost_timing_events(self):
+        controller = self._get_cost_aware_controller()
+        if (
+                controller is None
+                or not getattr(controller, "measure_cost", False)
+                or not torch.cuda.is_available()
+        ):
+            return None
+        return {
+            "verify_start": torch.cuda.Event(enable_timing=True),
+            "verify_end": torch.cuda.Event(enable_timing=True),
+            "draft_start": torch.cuda.Event(enable_timing=True),
+            "draft_end": torch.cuda.Event(enable_timing=True),
+        }
+
+    def _update_cost_aware_ema(self, events):
+        controller = self._get_cost_aware_controller()
+        if controller is None or events is None:
+            return
+        torch.cuda.synchronize()
+        verify_ms = events["verify_start"].elapsed_time(events["verify_end"])
+        draft_ms = events["draft_start"].elapsed_time(events["draft_end"])
+        draft_depth = max(getattr(controller, "last_depth", 1), 1)
+        controller.update_ema(draft_ms / draft_depth, verify_ms)
 
     @classmethod
     def from_pretrained(
@@ -95,6 +134,8 @@ class EaModel(nn.Module):
             depth=7,
             top_k=10,
             threshold=1.0,
+            enable_cost_aware_ddd=False,
+            cost_aware_kwargs=None,
             **kwargs,
     ):
         # assert Type=="LLaMA" or "Mixtral"
@@ -133,6 +174,10 @@ class EaModel(nn.Module):
             if not os.path.exists(load_model_path):
                 load_model_path = hf_hub_download(ea_model_path, "model.safetensors")
             ea_layer_state_dict = load_file(load_model_path)
+        controller = None
+        if enable_cost_aware_ddd:
+            controller = CostAwareController(**(cost_aware_kwargs or {}))
+
         model = cls(
             use_eagle3,
             base_model,
@@ -142,7 +187,8 @@ class EaModel(nn.Module):
             depth,
             top_k,
             threshold,
-            ea_layer_state_dict
+            ea_layer_state_dict,
+            controller,
         )
 
         if total_token == -1:
@@ -249,11 +295,14 @@ class EaModel(nn.Module):
         new_token = 0
         max_length = max_length - self.ea_layer.total_tokens - 10
         for idx in range(max_length):
+            cost_events = self._make_cost_timing_events()
             # with Timer("all"):
             self.base_model.model.tree_mask = tree_mask
 
             draft_tokens = draft_tokens.to(input_ids.device)
             # Target model forward, get logits
+            if cost_events is not None:
+                cost_events["verify_start"].record()
             logits, hidden_state_new, outputs = tree_decoding(
                 self,
                 draft_tokens,
@@ -262,6 +311,8 @@ class EaModel(nn.Module):
                 input_ids,
                 retrieve_indices,
             )
+            if cost_events is not None:
+                cost_events["verify_end"].record()
             # retrieve_indices=tree_buffers["retrieve_indices"]
             # logits = logits[0, retrieve_indices]
             draft_tokens = torch.cat((draft_tokens, padding), dim=1)
@@ -270,8 +321,13 @@ class EaModel(nn.Module):
             best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor
             )
+            controller = self._get_cost_aware_controller()
+            if controller is not None:
+                controller.record_acceptance(int(accept_length))
             # print(accept_length)
             # Adjusting the input sequence, draft model forward
+            if cost_events is not None:
+                cost_events["draft_start"].record()
             input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
                 input_ids,
                 candidates,
@@ -286,6 +342,9 @@ class EaModel(nn.Module):
                 hidden_state_new,
                 sample_p
             )
+            if cost_events is not None:
+                cost_events["draft_end"].record()
+                self._update_cost_aware_ema(cost_events)
 
             if is_llama3:
                 if stop_token_id in input_ids[0, input_len:].tolist():
@@ -432,11 +491,14 @@ class EaModel(nn.Module):
         new_token = 0
         max_length = max_length - self.ea_layer.total_tokens - 10
         for idx in range(max_length):
+            cost_events = self._make_cost_timing_events()
             # with Timer("all"):
             self.base_model.model.tree_mask = tree_mask
 
             draft_tokens = draft_tokens.to(input_ids.device)
             # with Timer("tree_decoding"):
+            if cost_events is not None:
+                cost_events["verify_start"].record()
             logits, hidden_state_new, outputs = tree_decoding(
                 self,
                 draft_tokens,
@@ -445,6 +507,8 @@ class EaModel(nn.Module):
                 input_ids,
                 retrieve_indices,
             )
+            if cost_events is not None:
+                cost_events["verify_end"].record()
             # retrieve_indices=tree_buffers["retrieve_indices"]
             # logits = logits[0, retrieve_indices]
             draft_tokens = torch.cat((draft_tokens, padding), dim=1)
@@ -452,8 +516,13 @@ class EaModel(nn.Module):
             best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor
             )
+            controller = self._get_cost_aware_controller()
+            if controller is not None:
+                controller.record_acceptance(int(accept_length))
             # print(accept_length)
             # with Timer("update_inference_inputs"):
+            if cost_events is not None:
+                cost_events["draft_start"].record()
             input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
                 input_ids,
                 candidates,
@@ -468,6 +537,9 @@ class EaModel(nn.Module):
                 hidden_state_new,
                 sample_p
             )
+            if cost_events is not None:
+                cost_events["draft_end"].record()
+                self._update_cost_aware_ema(cost_events)
 
             yield input_ids
 
