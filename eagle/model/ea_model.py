@@ -1,6 +1,7 @@
 import copy
 import json
 import time
+from collections import Counter
 
 import torch
 import torch.nn as nn
@@ -35,6 +36,13 @@ class EaModel(nn.Module):
             top_k,
             threshold,
             ea_layer_state_dict,
+            ddd_enabled=False,
+            ddd_mode="paper_exact",
+            ddd_max_draft_calls=11,
+            ddd_beam_width=10,
+            ddd_check_steps=(5, 7, 9),
+            ddd_threshold=-0.3,
+            ddd_verbose=False,
     ):
 
         super().__init__()
@@ -75,7 +83,17 @@ class EaModel(nn.Module):
             del self.ea_layer.d2t,self.ea_layer.t2d
         load_=self.ea_layer.load_state_dict(ea_layer_state_dict, strict=False)
         self.ea_layer.to(self.base_model.dtype).to(device)
+        self.configure_ddd(
+            ddd_enabled=ddd_enabled,
+            ddd_mode=ddd_mode,
+            ddd_max_draft_calls=ddd_max_draft_calls,
+            ddd_beam_width=ddd_beam_width,
+            ddd_check_steps=ddd_check_steps,
+            ddd_threshold=ddd_threshold,
+            ddd_verbose=ddd_verbose,
+        )
         self.ea_layer.init_tree()
+        self.ddd_runtime_metrics = None
 
     def get_tokenizer(self):
         """Get the tokenizer of the base model.
@@ -84,6 +102,67 @@ class EaModel(nn.Module):
             Tokenizer: The tokenizer of the base model.
         """
         return self.tokenizer
+
+    def configure_ddd(
+            self,
+            ddd_enabled=False,
+            ddd_mode="paper_exact",
+            ddd_max_draft_calls=11,
+            ddd_beam_width=10,
+            ddd_check_steps=(5, 7, 9),
+            ddd_threshold=-0.3,
+            ddd_verbose=False,
+    ):
+        self.ea_layer.configure_ddd(
+            ddd_enabled=ddd_enabled,
+            ddd_mode=ddd_mode,
+            ddd_max_draft_calls=ddd_max_draft_calls,
+            ddd_beam_width=ddd_beam_width,
+            ddd_check_steps=ddd_check_steps,
+            ddd_threshold=ddd_threshold,
+            ddd_verbose=ddd_verbose,
+        )
+
+    def _reset_ddd_runtime_metrics(self):
+        self.ddd_runtime_metrics = {
+            "draft_debug": [],
+            "draft_calls": [],
+            "accepted_lengths": [],
+            "early_stops": 0,
+            "stop_depths": [],
+        }
+
+    def _record_ddd_verify_debug(self):
+        debug = getattr(self.ea_layer, "last_ddd_debug", None)
+        if self.ddd_runtime_metrics is None or debug is None:
+            return
+        debug = copy.deepcopy(debug)
+        self.ddd_runtime_metrics["draft_debug"].append(debug)
+        self.ddd_runtime_metrics["draft_calls"].append(debug["draft_calls"])
+        if debug["stopped_by_ddd"]:
+            self.ddd_runtime_metrics["early_stops"] += 1
+            self.ddd_runtime_metrics["stop_depths"].append(debug["stop_call_count"])
+
+    def _record_ddd_accept_length(self, accept_length):
+        if self.ddd_runtime_metrics is None:
+            return
+        self.ddd_runtime_metrics["accepted_lengths"].append(int(accept_length))
+
+    def get_ddd_runtime_metrics(self):
+        metrics = self.ddd_runtime_metrics or {}
+        draft_calls = metrics.get("draft_calls", [])
+        stop_depths = metrics.get("stop_depths", [])
+        accepted_lengths = metrics.get("accepted_lengths", [])
+        avg_draft_calls = sum(draft_calls) / len(draft_calls) if draft_calls else 0.0
+        avg_accept_length = sum(accepted_lengths) / len(accepted_lengths) if accepted_lengths else 0.0
+        return {
+            "average_draft_calls_per_verify": avg_draft_calls,
+            "draft_call_distribution": dict(Counter(draft_calls)),
+            "ddd_early_stops": metrics.get("early_stops", 0),
+            "stop_depth_histogram": dict(Counter(stop_depths)),
+            "average_accepted_length": avg_accept_length,
+            "draft_debug": metrics.get("draft_debug", []),
+        }
 
     @classmethod
     def from_pretrained(
@@ -95,6 +174,13 @@ class EaModel(nn.Module):
             depth=7,
             top_k=10,
             threshold=1.0,
+            ddd_enabled=False,
+            ddd_mode="paper_exact",
+            ddd_max_draft_calls=11,
+            ddd_beam_width=10,
+            ddd_check_steps=(5, 7, 9),
+            ddd_threshold=-0.3,
+            ddd_verbose=False,
             **kwargs,
     ):
         # assert Type=="LLaMA" or "Mixtral"
@@ -142,7 +228,14 @@ class EaModel(nn.Module):
             depth,
             top_k,
             threshold,
-            ea_layer_state_dict
+            ea_layer_state_dict,
+            ddd_enabled=ddd_enabled,
+            ddd_mode=ddd_mode,
+            ddd_max_draft_calls=ddd_max_draft_calls,
+            ddd_beam_width=ddd_beam_width,
+            ddd_check_steps=ddd_check_steps,
+            ddd_threshold=ddd_threshold,
+            ddd_verbose=ddd_verbose,
         )
 
         if total_token == -1:
@@ -242,6 +335,7 @@ class EaModel(nn.Module):
 
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
+        self._reset_ddd_runtime_metrics()
         # prefill
         draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
             input_ids, self, past_key_values, logits_processor
@@ -250,6 +344,7 @@ class EaModel(nn.Module):
         max_length = max_length - self.ea_layer.total_tokens - 10
         for idx in range(max_length):
             # with Timer("all"):
+            self._record_ddd_verify_debug()
             self.base_model.model.tree_mask = tree_mask
 
             draft_tokens = draft_tokens.to(input_ids.device)
@@ -270,6 +365,7 @@ class EaModel(nn.Module):
             best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor
             )
+            self._record_ddd_accept_length(accept_length)
             # print(accept_length)
             # Adjusting the input sequence, draft model forward
             input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
@@ -426,6 +522,7 @@ class EaModel(nn.Module):
 
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
+        self._reset_ddd_runtime_metrics()
         draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
             input_ids, self, past_key_values, logits_processor
         )
@@ -433,6 +530,7 @@ class EaModel(nn.Module):
         max_length = max_length - self.ea_layer.total_tokens - 10
         for idx in range(max_length):
             # with Timer("all"):
+            self._record_ddd_verify_debug()
             self.base_model.model.tree_mask = tree_mask
 
             draft_tokens = draft_tokens.to(input_ids.device)
@@ -452,6 +550,7 @@ class EaModel(nn.Module):
             best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor
             )
+            self._record_ddd_accept_length(accept_length)
             # print(accept_length)
             # with Timer("update_inference_inputs"):
             input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(

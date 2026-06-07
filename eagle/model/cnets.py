@@ -35,10 +35,12 @@ try:
     from .configs import EConfig
     from .utils_c import *
     from .choices import *
+    from .ddd import DDDConfig, make_ddd_debug, normalize_check_steps, should_stop_ddd, update_ddd_logprobsum
 except:
     from configs import EConfig
     from utils_c import *
     from choices import *
+    from ddd import DDDConfig, make_ddd_debug, normalize_check_steps, should_stop_ddd, update_ddd_logprobsum
     from utils import prepare_logits_processor
 
 
@@ -522,6 +524,8 @@ class Model(nn.Module):
         self.total_tokens = total_tokens - 1
         self.depth = depth
         self.threshold = math.log(threshold)
+        self.ddd_config = DDDConfig()
+        self.last_ddd_debug = None
         # print("total_tokens",total_tokens)
         # print("depth",depth)
         # print("top_k",top_k)
@@ -666,6 +670,34 @@ class Model(nn.Module):
     def reset_kv(self):
         self.stable_kv = None
 
+    def configure_ddd(
+            self,
+            ddd_enabled=False,
+            ddd_mode="paper_exact",
+            ddd_max_draft_calls=11,
+            ddd_beam_width=10,
+            ddd_check_steps=None,
+            ddd_threshold=-0.3,
+            ddd_verbose=False,
+    ):
+        check_steps = normalize_check_steps(ddd_check_steps)
+        self.ddd_config = DDDConfig(
+            enabled=bool(ddd_enabled),
+            mode=ddd_mode,
+            max_draft_calls=int(ddd_max_draft_calls),
+            beam_width=int(ddd_beam_width),
+            check_steps=check_steps,
+            threshold=float(ddd_threshold),
+            verbose=bool(ddd_verbose),
+        )
+        if self.ddd_config.enabled:
+            if self.ddd_config.mode != "paper_exact":
+                raise ValueError("Only ddd_mode='paper_exact' is implemented.")
+            self.top_k = self.ddd_config.beam_width
+            self.depth = self.ddd_config.max_draft_calls - 1
+            if hasattr(self, "tree_mask_init"):
+                self.init_tree()
+
     @torch.no_grad()
     def topK_genrate(self, hidden_states, input_ids, head, logits_processor):
 
@@ -673,6 +705,9 @@ class Model(nn.Module):
         total_tokens = self.total_tokens
         depth = self.depth
         top_k = self.top_k
+        ddd_config = self.ddd_config
+        if ddd_config.enabled and top_k != ddd_config.beam_width:
+            raise ValueError("paper-exact DDD requires beam width to equal ddd_beam_width.")
 
         sample_token = input_ids[:, -1]
 
@@ -703,6 +738,10 @@ class Model(nn.Module):
         top = torch.topk(last_p, top_k, dim=-1)
         topk_index, topk_p = top.indices, top.values
         scores = topk_p[0]
+        call_count = 1
+        checked_h = []
+        stopped_by_ddd = False
+        stop_call_count = None
         scores_list.append(scores[None])
         parents_list.append(torch.zeros(1, dtype=torch.long, device=scores.device))
         if self.config.vocab_size==self.config.draft_vocab_size:
@@ -717,11 +756,22 @@ class Model(nn.Module):
 
         # 4
         for i in range(depth):
+            if ddd_config.enabled:
+                should_stop, heuristic = should_stop_ddd(ddd_config, call_count, scores)
+                if heuristic is not None:
+                    checked_h.append((call_count, heuristic.detach().cpu().item()))
+                if should_stop:
+                    stopped_by_ddd = True
+                    stop_call_count = call_count
+                    break
+                if call_count >= ddd_config.max_draft_calls:
+                    break
             self.tree_mask = tree_mask
             position_ids = len_posi + self.position_ids
             # with Timer("draft one"):
             out_hidden, past_key_values = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
                                                position_ids=position_ids, use_cache=True)
+            call_count += 1
             len_posi += 1
 
             # with Timer("sort1"):
@@ -741,9 +791,13 @@ class Model(nn.Module):
 
             topk_cs = torch.topk(cu_scores.view(-1), top_k, dim=-1)
             topk_cs_index, topk_cs_p = topk_cs.indices, topk_cs.values
-            scores = topk_cs_p
 
             out_ids = topk_cs_index // top_k
+            if ddd_config.enabled:
+                selected_token_logprobs = topk_p.reshape(-1)[topk_cs_index]
+                scores = update_ddd_logprobsum(scores, out_ids, selected_token_logprobs)
+            else:
+                scores = topk_cs_p
             input_hidden = out_hidden[:, out_ids]
 
             input_ids = topk_index.view(-1)[topk_cs_index][None]
@@ -759,6 +813,8 @@ class Model(nn.Module):
 
         scores_list = torch.cat(scores_list, dim=0).view(-1)
         ss_token_list = torch.cat(ss_token, dim=0).view(-1)
+        if ddd_config.enabled:
+            total_tokens = min(total_tokens, scores_list.shape[0])
         top_scores = torch.topk(scores_list, total_tokens, dim=-1)
         top_scores_index = top_scores.indices
         top_scores_index = torch.sort(top_scores_index).values
@@ -823,6 +879,14 @@ class Model(nn.Module):
         retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long)
         del mask_index, mask_index_list, noleaf_index, noleaf_num, leaf_num, max_depth, rid
         tree_position_ids = tree_position_ids.to(hidden_states.device)
+        self.last_ddd_debug = make_ddd_debug(
+            ddd_config,
+            call_count,
+            stopped_by_ddd,
+            stop_call_count,
+            checked_h,
+            scores,
+        )
 
         return draft_tokens, retrieve_indices, tree_mask, tree_position_ids
 
