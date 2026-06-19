@@ -22,6 +22,7 @@ import copy
 import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 import math
+import time
 from typing import List, Optional, Tuple, Union
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -36,11 +37,35 @@ try:
     from .utils_c import *
     from .choices import *
     from .ddd import DDDConfig, make_ddd_debug, normalize_check_steps, should_stop_ddd, update_ddd_logprobsum
+    from .opt_tree import (
+        OptTreeConfig,
+        build_draft_nodes_from_eagle,
+        connected_selected_leaf_min_path_logprob,
+        connected_selected_min_path_logprob,
+        depth_histogram,
+        raw_topn_threshold,
+        rebuild_selected_tree,
+        restrict_to_overexpanded_pool,
+        select_opt_tree,
+        validate_connected_subtree,
+    )
 except:
     from configs import EConfig
     from utils_c import *
     from choices import *
     from ddd import DDDConfig, make_ddd_debug, normalize_check_steps, should_stop_ddd, update_ddd_logprobsum
+    from opt_tree import (
+        OptTreeConfig,
+        build_draft_nodes_from_eagle,
+        connected_selected_leaf_min_path_logprob,
+        connected_selected_min_path_logprob,
+        depth_histogram,
+        raw_topn_threshold,
+        rebuild_selected_tree,
+        restrict_to_overexpanded_pool,
+        select_opt_tree,
+        validate_connected_subtree,
+    )
     from utils import prepare_logits_processor
 
 
@@ -526,6 +551,8 @@ class Model(nn.Module):
         self.threshold = math.log(threshold)
         self.ddd_config = DDDConfig()
         self.last_ddd_debug = None
+        self.opt_tree_config = OptTreeConfig()
+        self.last_opt_tree_debug = None
         # print("total_tokens",total_tokens)
         # print("depth",depth)
         # print("top_k",top_k)
@@ -698,6 +725,34 @@ class Model(nn.Module):
             if hasattr(self, "tree_mask_init"):
                 self.init_tree()
 
+    def configure_opt_tree(
+            self,
+            opt_tree_enabled=False,
+            opt_tree_budget=60,
+            opt_tree_overexpand_factor=1.0,
+            opt_tree_mode="path_prob_greedy",
+            opt_tree_debug=False,
+            opt_tree_delta=0.0,
+            opt_tree_lookahead_stop=False,
+            opt_tree_lookahead_margin=0.0,
+            opt_tree_min_expand_depth=1,
+            opt_tree_max_expand_depth=None,
+    ):
+        self.opt_tree_config = OptTreeConfig(
+            enabled=bool(opt_tree_enabled),
+            budget=int(opt_tree_budget),
+            overexpand_factor=float(opt_tree_overexpand_factor),
+            mode=str(opt_tree_mode),
+            debug=bool(opt_tree_debug),
+            delta=float(opt_tree_delta),
+            lookahead_stop=bool(opt_tree_lookahead_stop),
+            lookahead_margin=float(opt_tree_lookahead_margin),
+            min_expand_depth=int(opt_tree_min_expand_depth),
+            max_expand_depth=None if opt_tree_max_expand_depth is None else int(opt_tree_max_expand_depth),
+        )
+        if self.opt_tree_config.enabled and self.ddd_config.enabled:
+            raise ValueError("OPT-Tree and DDD are not supported together in this minimal implementation.")
+
     @torch.no_grad()
     def topK_genrate(self, hidden_states, input_ids, head, logits_processor):
 
@@ -706,6 +761,20 @@ class Model(nn.Module):
         depth = self.depth
         top_k = self.top_k
         ddd_config = self.ddd_config
+        opt_tree_config = getattr(self, "opt_tree_config", OptTreeConfig())
+        opt_tree_enabled = bool(opt_tree_config.enabled)
+        expansion_start = time.perf_counter() if opt_tree_enabled else None
+        tree_expansion_time_s = 0.0
+        opt_tree_stop_reason = None
+        opt_tree_stop_depth = None
+        opt_tree_last_esub = None
+        opt_tree_last_esub_gain = None
+        lookahead_stopped = False
+        lookahead_stop_depth = None
+        lookahead_stop_reason = None
+        lookahead_next_layer_upper_bound = None
+        lookahead_selected_threshold = None
+        lookahead_checks = []
         if ddd_config.enabled and top_k != ddd_config.beam_width:
             raise ValueError("paper-exact DDD requires beam width to equal ddd_beam_width.")
 
@@ -735,27 +804,109 @@ class Model(nn.Module):
         last_headout = self.lm_head(self.norm(last_hidden))
 
         last_p = self.logsoftmax(last_headout)
-        top = torch.topk(last_p, top_k, dim=-1)
+        opt_non_root_budget = max(1, int(opt_tree_config.budget))
+        draft_top_k = opt_non_root_budget if opt_tree_enabled and not ddd_config.enabled else top_k
+        top = torch.topk(last_p, draft_top_k, dim=-1)
         topk_index, topk_p = top.indices, top.values
         scores = topk_p[0]
+        frontier_upper_bound = scores[0]
         call_count = 1
         checked_h = []
         stopped_by_ddd = False
         stop_call_count = None
-        scores_list.append(scores[None])
-        parents_list.append(torch.zeros(1, dtype=torch.long, device=scores.device))
+        scores_list.append(scores.reshape(-1))
+        parents_list.append(torch.zeros(scores.numel(), dtype=torch.long, device=scores.device))
         if self.config.vocab_size==self.config.draft_vocab_size:
-            ss_token.append(topk_index)
+            ss_token.append(topk_index.reshape(-1))
             input_ids = topk_index
         else:
-            ss_token.append(topk_index+self.d2t[topk_index])
+            ss_token.append((topk_index+self.d2t[topk_index]).reshape(-1))
             input_ids = topk_index+self.d2t[topk_index]
-        input_hidden = last_hidden[None].repeat(1, top_k, 1)
-        tree_mask = self.tree_mask_init
-        topk_cs_index = torch.arange(top_k, device=self.embed_tokens.weight.device)
+        input_hidden = last_hidden[None].repeat(1, draft_top_k, 1)
+        tree_mask = (
+            torch.eye(draft_top_k, device=self.embed_tokens.weight.device, dtype=torch.bool)[None, None]
+            if opt_tree_enabled and not ddd_config.enabled
+            else self.tree_mask_init
+        )
+        frontier_node_ids = torch.arange(1, draft_top_k + 1, device=scores.device, dtype=torch.long)
+        next_node_id = draft_top_k + 1
+        full_draft_call_budget = depth + 1
+        lookahead_budget = max(1, int(opt_tree_config.budget))
+        previous_esub = torch.tensor(0.0, device=scores.device)
+
+        def current_topn_values():
+            flat_scores = torch.cat([chunk.reshape(-1) for chunk in scores_list], dim=0)
+            non_root_budget = min(lookahead_budget, flat_scores.numel())
+            return torch.topk(flat_scores, non_root_budget, dim=-1).values
 
         # 4
         for i in range(depth):
+            if opt_tree_enabled and not ddd_config.enabled:
+                topn_values = current_topn_values()
+                current_esub = torch.exp(topn_values.float()).sum()
+                esub_gain = current_esub - previous_esub
+                posterior_stop_tensor = esub_gain <= float(opt_tree_config.delta)
+
+                max_expand_depth_reached = bool(
+                    opt_tree_config.lookahead_stop
+                    and opt_tree_config.max_expand_depth is not None
+                    and call_count >= opt_tree_config.max_expand_depth
+                )
+                lookahead_check_active = bool(
+                    opt_tree_config.lookahead_stop
+                    and not max_expand_depth_reached
+                    and call_count >= opt_tree_config.min_expand_depth
+                )
+                threshold_tensor = None
+                pre_upper_tensor = None
+                lookahead_stop_tensor = None
+                decision_tensor = posterior_stop_tensor.to(torch.int8)
+                if lookahead_check_active:
+                    threshold_tensor = topn_values[-1]
+                    pre_upper_tensor = frontier_upper_bound
+                    lookahead_stop_tensor = (
+                        pre_upper_tensor + float(opt_tree_config.lookahead_margin)
+                        <= threshold_tensor
+                    )
+                    decision_tensor = decision_tensor + lookahead_stop_tensor.to(torch.int8) * 2
+
+                # Both data-dependent branches share the synchronization that
+                # Algorithm 1 already needs for its posterior stop decision.
+                decision = int(decision_tensor.detach().item())
+                posterior_should_stop = bool(decision & 1)
+                lookahead_should_stop = bool(decision & 2)
+                if opt_tree_config.debug or posterior_should_stop:
+                    opt_tree_last_esub = float(current_esub.detach().item())
+                    opt_tree_last_esub_gain = float(esub_gain.detach().item())
+                if posterior_should_stop:
+                    opt_tree_stop_reason = "posterior_delta"
+                    opt_tree_stop_depth = int(call_count)
+                    break
+                previous_esub = current_esub
+
+                if max_expand_depth_reached:
+                    lookahead_stopped = True
+                    lookahead_stop_depth = call_count
+                    lookahead_stop_reason = "max_expand_depth"
+                    opt_tree_stop_reason = "max_expand_depth"
+                    opt_tree_stop_depth = int(call_count)
+                    break
+                if lookahead_check_active and (opt_tree_config.debug or lookahead_should_stop):
+                    lookahead_selected_threshold = float(threshold_tensor.detach().item())
+                    lookahead_next_layer_upper_bound = float(pre_upper_tensor.detach().item())
+                    lookahead_checks.append({
+                        "depth": int(call_count),
+                        "selected_threshold": lookahead_selected_threshold,
+                        "next_layer_upper_bound": lookahead_next_layer_upper_bound,
+                        "method": "pre_call_frontier_bound_shared_sync",
+                    })
+                if lookahead_should_stop:
+                    lookahead_stopped = True
+                    lookahead_stop_depth = call_count
+                    lookahead_stop_reason = "frontier_bound"
+                    opt_tree_stop_reason = "frontier_bound"
+                    opt_tree_stop_depth = int(call_count)
+                    break
             if ddd_config.enabled:
                 should_stop, heuristic = should_stop_ddd(ddd_config, call_count, scores)
                 if heuristic is not None:
@@ -767,7 +918,11 @@ class Model(nn.Module):
                 if call_count >= ddd_config.max_draft_calls:
                     break
             self.tree_mask = tree_mask
-            position_ids = len_posi + self.position_ids
+            position_ids = len_posi + torch.zeros(
+                input_ids.shape[1],
+                device=self.embed_tokens.weight.device,
+                dtype=torch.long,
+            )
             # with Timer("draft one"):
             out_hidden, past_key_values = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
                                                position_ids=position_ids, use_cache=True)
@@ -775,24 +930,22 @@ class Model(nn.Module):
             len_posi += 1
 
             # with Timer("sort1"):
-            bias1 = top_k if i > 0 else 0
-            bias2 = max(0, i - 1)
-            bias = 1 + top_k ** 2 * bias2 + bias1
-            parents = (topk_cs_index + bias)
-            parents_list.append(parents)
-
             last_headout = self.lm_head(self.norm(out_hidden[0]))
             last_p = self.logsoftmax(last_headout)
 
-            top = torch.topk(last_p, top_k, dim=-1)
+            top = torch.topk(last_p, draft_top_k, dim=-1)
             topk_index, topk_p = top.indices, top.values
 
             cu_scores = topk_p + scores[:, None]
 
-            topk_cs = torch.topk(cu_scores.view(-1), top_k, dim=-1)
+            frontier_keep = min(draft_top_k, cu_scores.numel())
+            topk_cs = torch.topk(cu_scores.view(-1), frontier_keep, dim=-1)
             topk_cs_index, topk_cs_p = topk_cs.indices, topk_cs.values
+            frontier_upper_bound = topk_cs_p[0]
+            topk_cs_index = torch.sort(topk_cs_index).values
+            topk_cs_p = cu_scores.view(-1)[topk_cs_index]
 
-            out_ids = topk_cs_index // top_k
+            out_ids = topk_cs_index // draft_top_k
             if ddd_config.enabled:
                 selected_token_logprobs = topk_p.reshape(-1)[topk_cs_index]
                 scores = update_ddd_logprobsum(scores, out_ids, selected_token_logprobs)
@@ -802,37 +955,186 @@ class Model(nn.Module):
 
             input_ids = topk_index.view(-1)[topk_cs_index][None]
 
+            parent_refs_all = frontier_node_ids.repeat_interleave(draft_top_k)
+            child_node_ids_all = torch.arange(
+                next_node_id,
+                next_node_id + cu_scores.numel(),
+                device=scores.device,
+                dtype=torch.long,
+            )
+
             if self.config.vocab_size == self.config.draft_vocab_size:
-                ss_token.append(topk_index)
+                next_tokens_flat = topk_index.reshape(-1)
             else:
                 input_ids = input_ids + self.d2t[input_ids]
-                ss_token.append(topk_index+self.d2t[topk_index])
-            scores_list.append(cu_scores)
-            tree_mask = torch.cat((tree_mask[:, :, out_ids], self.tree_mask_init), dim=3)
+                next_tokens_flat = (topk_index+self.d2t[topk_index]).reshape(-1)
+            if opt_tree_enabled and not ddd_config.enabled:
+                scores_list.append(cu_scores.reshape(-1)[topk_cs_index])
+                ss_token.append(next_tokens_flat[topk_cs_index])
+                parents_list.append(parent_refs_all[topk_cs_index])
+                frontier_node_ids = torch.arange(
+                    next_node_id,
+                    next_node_id + frontier_keep,
+                    device=scores.device,
+                    dtype=torch.long,
+                )
+                next_node_id += frontier_keep
+                eye = torch.eye(frontier_keep, device=self.embed_tokens.weight.device, dtype=torch.bool)[None, None]
+                tree_mask = torch.cat((tree_mask[:, :, out_ids], eye), dim=3)
+            else:
+                scores_list.append(cu_scores.reshape(-1))
+                ss_token.append(next_tokens_flat)
+                parents_list.append(parent_refs_all)
+                frontier_node_ids = child_node_ids_all[topk_cs_index]
+                next_node_id += cu_scores.numel()
+                tree_mask = torch.cat((tree_mask[:, :, out_ids], self.tree_mask_init), dim=3)
+            if (
+                    opt_tree_enabled
+                    and opt_tree_config.lookahead_stop
+                    and opt_tree_config.max_expand_depth is not None
+                    and call_count >= opt_tree_config.max_expand_depth
+            ):
+                lookahead_stopped = True
+                lookahead_stop_depth = call_count
+                lookahead_stop_reason = "max_expand_depth"
+                opt_tree_stop_reason = "max_expand_depth"
+                opt_tree_stop_depth = int(call_count)
+                break
 
 
+        if expansion_start is not None:
+            tree_expansion_time_s = float(time.perf_counter() - expansion_start)
         scores_list = torch.cat(scores_list, dim=0).view(-1)
         ss_token_list = torch.cat(ss_token, dim=0).view(-1)
+        parent_refs_for_nodes = torch.cat(parents_list, dim=0).view(-1).long()
         if ddd_config.enabled:
             total_tokens = min(total_tokens, scores_list.shape[0])
-        top_scores = torch.topk(scores_list, total_tokens, dim=-1)
-        top_scores_index = top_scores.indices
-        top_scores_index = torch.sort(top_scores_index).values
+        opt_debug = None
+        if opt_tree_config.enabled:
+            if ddd_config.enabled:
+                raise ValueError("OPT-Tree and DDD are not supported together in this minimal implementation.")
+            if opt_tree_stop_reason is None:
+                opt_tree_stop_reason = "max_draft_calls"
+                opt_tree_stop_depth = int(call_count)
+            selection_start = time.perf_counter()
+            paper_budget = min(max(1, int(opt_tree_config.budget)), scores_list.numel())
+            selection_budget_with_root = paper_budget + 1
+            top_scores = torch.topk(scores_list, paper_budget, dim=-1)
+            selected_original_indices = torch.sort(top_scores.indices).values
+            tree_selection_time_s = float(time.perf_counter() - selection_start)
 
-        draft_tokens = ss_token_list[top_scores_index]
-        draft_tokens = torch.cat((sample_token, draft_tokens), dim=0)
+            rebuild_start = time.perf_counter()
+            total_tokens = int(paper_budget)
+            draft_tokens = ss_token_list[selected_original_indices]
+            draft_tokens = torch.cat((sample_token, draft_tokens), dim=0)
 
-        draft_parents = torch.cat(parents_list, dim=0)[top_scores_index // top_k].long()
-        mask_index = torch.searchsorted(top_scores_index, draft_parents - 1, right=False)
-        # mask_index[(top_scores_index[mask_index]!=draft_parents - 1)]=-1
-        mask_index[draft_parents == 0] = -1
-        mask_index = mask_index + 1
-        mask_index_list = mask_index.tolist()
+            draft_parents = parent_refs_for_nodes[selected_original_indices].long()
+            mask_index = torch.searchsorted(
+                selected_original_indices,
+                draft_parents - 1,
+                right=False,
+            )
+            if opt_tree_config.debug:
+                non_root_parent = draft_parents != 0
+                safe_positions = mask_index.clamp(max=max(0, total_tokens - 1))
+                parent_is_selected = (
+                    selected_original_indices[safe_positions] == draft_parents - 1
+                )
+                if not bool(parent_is_selected[non_root_parent].all().detach().item()):
+                    raise ValueError("OPT-Tree tensor top-k selection is missing a selected node's parent.")
+            mask_index[draft_parents == 0] = -1
+            mask_index = mask_index + 1
+            mask_index_list = mask_index.tolist()
+            tree_rebuild_time_s = float(time.perf_counter() - rebuild_start)
+
+            raw_threshold = float(top_scores.values[-1].detach().item())
+            selected_path_logprob_sum = float(top_scores.values.sum().detach().item())
+            connected_min = raw_threshold
+            connected_leaf_min = None
+            threshold_delta = 0.0
+
+            if opt_tree_config.debug:
+                root_token_id = int(sample_token.reshape(-1)[0].detach().item())
+                nodes = build_draft_nodes_from_eagle(
+                    scores_list,
+                    ss_token_list,
+                    parent_refs_for_nodes,
+                    root_token_id,
+                    strict_parents=True,
+                )
+                reference_ids = select_opt_tree(nodes, selection_budget_with_root)
+                tensor_ids = {0, *(selected_original_indices.detach().cpu().add(1).tolist())}
+                if tensor_ids != reference_ids:
+                    raise ValueError("Tensor OPT-Tree selection differs from the paper-reference selector.")
+            opt_debug = {
+                "enabled": True,
+                "budget": int(opt_tree_config.budget),
+                "budget_counts_root": False,
+                "selected_budget_with_root": int(selection_budget_with_root),
+                "delta": float(opt_tree_config.delta),
+                "opt_tree_stop_reason": opt_tree_stop_reason,
+                "opt_tree_stop_depth": opt_tree_stop_depth,
+                "opt_tree_last_esub": opt_tree_last_esub,
+                "opt_tree_last_esub_gain": opt_tree_last_esub_gain,
+                "overexpand_factor": float(opt_tree_config.overexpand_factor),
+                "num_available_nodes": int(scores_list.numel() + 1),
+                "num_overexpanded_nodes": int(scores_list.numel() + 1),
+                "num_selected_nodes": int(total_tokens + 1),
+                "selected_depth_histogram": {},
+                "selected_path_logprob_sum": selected_path_logprob_sum,
+                "raw_topN_threshold": raw_threshold,
+                "connected_selected_min_path_logprob": connected_min,
+                "connected_selected_leaf_min_path_logprob": connected_leaf_min,
+                "connected_threshold_delta": threshold_delta,
+                "connected_threshold_warning": bool(
+                    threshold_delta is not None and abs(threshold_delta) > 1e-6
+                ),
+                "lookahead_stop_enabled": bool(opt_tree_config.lookahead_stop),
+                "lookahead_stopped": bool(lookahead_stopped),
+                "lookahead_stop_depth": lookahead_stop_depth,
+                "lookahead_stop_reason": lookahead_stop_reason,
+                "lookahead_next_layer_upper_bound": lookahead_next_layer_upper_bound,
+                "lookahead_selected_threshold": lookahead_selected_threshold,
+                "lookahead_margin": float(opt_tree_config.lookahead_margin),
+                "lookahead_checks": lookahead_checks,
+                "num_nodes_without_stop_estimate": int(draft_top_k * full_draft_call_budget),
+                "num_nodes_with_stop": int(scores_list.shape[0]),
+                "draft_calls_saved_estimate": int(max(0, full_draft_call_budget - call_count)),
+                "tree_expansion_time_s": float(tree_expansion_time_s),
+                "tree_selection_time_s": float(tree_selection_time_s),
+                "tree_rebuild_time_s": float(tree_rebuild_time_s),
+                "tree_mask_build_time_s": 0.0,
+                "opt_tree_overhead_s": 0.0,
+            }
+        else:
+            top_scores = torch.topk(scores_list, total_tokens, dim=-1)
+            top_scores_index = top_scores.indices
+            top_scores_index = torch.sort(top_scores_index).values
+
+            draft_tokens = ss_token_list[top_scores_index]
+            draft_tokens = torch.cat((sample_token, draft_tokens), dim=0)
+
+            draft_parents = parent_refs_for_nodes[top_scores_index].long()
+            mask_index = torch.searchsorted(top_scores_index, draft_parents - 1, right=False)
+            # mask_index[(top_scores_index[mask_index]!=draft_parents - 1)]=-1
+            mask_index[draft_parents == 0] = -1
+            mask_index = mask_index + 1
+            mask_index_list = mask_index.tolist()
         # with Timer("mask"):
+        mask_build_start = None
+        if opt_debug is not None:
+            mask_build_start = time.perf_counter()
         tree_mask = torch.eye(total_tokens + 1).bool()
         tree_mask[:, 0] = True
         for i in range(total_tokens):
             tree_mask[i + 1].add_(tree_mask[mask_index_list[i]])
+        if opt_debug is not None and mask_build_start is not None:
+            opt_debug["tree_mask_build_time_s"] = float(time.perf_counter() - mask_build_start)
+            opt_debug["opt_tree_overhead_s"] = (
+                opt_debug["tree_selection_time_s"]
+                + opt_debug["tree_rebuild_time_s"]
+                + opt_debug["tree_mask_build_time_s"]
+            )
 
 
         tree_position_ids = torch.sum(tree_mask, dim=1) - 1
@@ -840,7 +1142,7 @@ class Model(nn.Module):
         tree_mask = tree_mask.float()[None, None]
         draft_tokens = draft_tokens[None]
 
-        del parents_list, scores_list, ss_token, ss_token_list, draft_parents
+        del parents_list, scores_list, ss_token, ss_token_list
 
         # with Timer("retrieve"):
 
@@ -854,6 +1156,12 @@ class Model(nn.Module):
 
         rid = 0
         position_ids_list = tree_position_ids.tolist()
+        if opt_debug is not None:
+            selected_depth_histogram = {}
+            for depth_value in position_ids_list:
+                key = str(int(depth_value))
+                selected_depth_histogram[key] = selected_depth_histogram.get(key, 0) + 1
+            opt_debug["selected_depth_histogram"] = selected_depth_histogram
 
         for i in range(total_tokens + 1):
             if i not in noleaf_index:
@@ -887,6 +1195,7 @@ class Model(nn.Module):
             checked_h,
             scores,
         )
+        self.last_opt_tree_debug = opt_debug
 
         return draft_tokens, retrieve_indices, tree_mask, tree_position_ids
 

@@ -92,6 +92,8 @@ class EaModel(nn.Module):
             ddd_threshold=ddd_threshold,
             ddd_verbose=ddd_verbose,
         )
+        if hasattr(self.ea_layer, "configure_opt_tree"):
+            self.ea_layer.configure_opt_tree(opt_tree_enabled=False)
         self.ea_layer.init_tree()
         self.ddd_runtime_metrics = None
 
@@ -123,9 +125,40 @@ class EaModel(nn.Module):
             ddd_verbose=ddd_verbose,
         )
 
+    def configure_opt_tree(
+            self,
+            opt_tree_enabled=False,
+            opt_tree_budget=60,
+            opt_tree_overexpand_factor=1.0,
+            opt_tree_mode="path_prob_greedy",
+            opt_tree_debug=False,
+            opt_tree_delta=0.0,
+            opt_tree_lookahead_stop=False,
+            opt_tree_lookahead_margin=0.0,
+            opt_tree_min_expand_depth=1,
+            opt_tree_max_expand_depth=None,
+    ):
+        if not hasattr(self.ea_layer, "configure_opt_tree"):
+            if opt_tree_enabled:
+                raise ValueError("OPT-Tree is only implemented for EAGLE-3 in this minimal version.")
+            return
+        self.ea_layer.configure_opt_tree(
+            opt_tree_enabled=opt_tree_enabled,
+            opt_tree_budget=opt_tree_budget,
+            opt_tree_overexpand_factor=opt_tree_overexpand_factor,
+            opt_tree_mode=opt_tree_mode,
+            opt_tree_debug=opt_tree_debug,
+            opt_tree_delta=opt_tree_delta,
+            opt_tree_lookahead_stop=opt_tree_lookahead_stop,
+            opt_tree_lookahead_margin=opt_tree_lookahead_margin,
+            opt_tree_min_expand_depth=opt_tree_min_expand_depth,
+            opt_tree_max_expand_depth=opt_tree_max_expand_depth,
+        )
+
     def _reset_ddd_runtime_metrics(self):
         self.ddd_runtime_metrics = {
             "draft_debug": [],
+            "opt_tree_debug": [],
             "draft_calls": [],
             "accepted_lengths": [],
             "early_stops": 0,
@@ -133,6 +166,8 @@ class EaModel(nn.Module):
         }
         if hasattr(self.ea_layer, "last_ddd_debug"):
             self.ea_layer.last_ddd_debug = None
+        if hasattr(self.ea_layer, "last_opt_tree_debug"):
+            self.ea_layer.last_opt_tree_debug = None
 
     def reset_ddd_runtime_metrics(self):
         self._reset_ddd_runtime_metrics()
@@ -140,6 +175,9 @@ class EaModel(nn.Module):
     def _record_ddd_verify_debug(self):
         debug = getattr(self.ea_layer, "last_ddd_debug", None)
         if self.ddd_runtime_metrics is None or debug is None:
+            opt_debug = getattr(self.ea_layer, "last_opt_tree_debug", None)
+            if self.ddd_runtime_metrics is not None and opt_debug is not None:
+                self.ddd_runtime_metrics["opt_tree_debug"].append(copy.deepcopy(opt_debug))
             return
         debug = copy.deepcopy(debug)
         self.ddd_runtime_metrics["draft_debug"].append(debug)
@@ -147,6 +185,9 @@ class EaModel(nn.Module):
         if debug["stopped_by_ddd"]:
             self.ddd_runtime_metrics["early_stops"] += 1
             self.ddd_runtime_metrics["stop_depths"].append(debug["stop_call_count"])
+        opt_debug = getattr(self.ea_layer, "last_opt_tree_debug", None)
+        if opt_debug is not None:
+            self.ddd_runtime_metrics["opt_tree_debug"].append(copy.deepcopy(opt_debug))
 
     def _record_ddd_accept_length(self, accept_length):
         if self.ddd_runtime_metrics is None:
@@ -167,6 +208,80 @@ class EaModel(nn.Module):
             "stop_depth_histogram": dict(Counter(stop_depths)),
             "average_accepted_length": avg_accept_length,
             "draft_debug": metrics.get("draft_debug", []),
+        }
+
+    def get_opt_tree_runtime_metrics(self):
+        metrics = self.ddd_runtime_metrics or {}
+        debug = metrics.get("opt_tree_debug", [])
+        if not debug:
+            return {
+                "enabled": False,
+                "num_verify_rounds": 0,
+                "num_overexpanded_nodes_mean": 0.0,
+                "num_selected_nodes_mean": 0.0,
+                "selected_path_logprob_sum_mean": 0.0,
+                "opt_tree_stop_reason_histogram": {},
+                "posterior_delta_stops": 0,
+                "lookahead_stop_rate": 0.0,
+                "lookahead_stops": 0,
+                "frontier_bound_stops": 0,
+                "lookahead_stop_depth_mean": 0.0,
+                "draft_calls_saved_estimate_mean": 0.0,
+                "num_nodes_saved_mean": 0.0,
+                "tree_expansion_time_s": 0.0,
+                "tree_selection_time_s": 0.0,
+                "tree_rebuild_time_s": 0.0,
+                "tree_mask_build_time_s": 0.0,
+                "opt_tree_overhead_s": 0.0,
+                "selected_depth_histogram": {},
+                "debug": [],
+            }
+        depth_hist = Counter()
+        stop_reason_hist = Counter()
+        for item in debug:
+            for key, value in item.get("selected_depth_histogram", {}).items():
+                depth_hist[str(key)] += int(value)
+            reason = item.get("opt_tree_stop_reason")
+            if reason:
+                stop_reason_hist[str(reason)] += 1
+        lookahead_stops = [item for item in debug if item.get("lookahead_stopped")]
+        frontier_bound_stops = [
+            item for item in debug if item.get("lookahead_stop_reason") == "frontier_bound"
+        ]
+        posterior_delta_stops = [
+            item for item in debug if item.get("opt_tree_stop_reason") == "posterior_delta"
+        ]
+        stop_depths = [
+            int(item["lookahead_stop_depth"])
+            for item in lookahead_stops
+            if item.get("lookahead_stop_depth") is not None
+        ]
+        node_savings = [
+            int(item.get("num_nodes_without_stop_estimate", 0))
+            - int(item.get("num_nodes_with_stop", 0))
+            for item in debug
+        ]
+        return {
+            "enabled": True,
+            "num_verify_rounds": len(debug),
+            "num_overexpanded_nodes_mean": sum(item.get("num_overexpanded_nodes", 0) for item in debug) / len(debug),
+            "num_selected_nodes_mean": sum(item.get("num_selected_nodes", 0) for item in debug) / len(debug),
+            "selected_path_logprob_sum_mean": sum(item.get("selected_path_logprob_sum", 0.0) for item in debug) / len(debug),
+            "opt_tree_stop_reason_histogram": dict(sorted(stop_reason_hist.items())),
+            "posterior_delta_stops": len(posterior_delta_stops),
+            "lookahead_stop_rate": len(lookahead_stops) / len(debug),
+            "lookahead_stops": len(lookahead_stops),
+            "frontier_bound_stops": len(frontier_bound_stops),
+            "lookahead_stop_depth_mean": sum(stop_depths) / len(stop_depths) if stop_depths else 0.0,
+            "draft_calls_saved_estimate_mean": sum(item.get("draft_calls_saved_estimate", 0) for item in debug) / len(debug),
+            "num_nodes_saved_mean": sum(node_savings) / len(node_savings) if node_savings else 0.0,
+            "tree_expansion_time_s": sum(item.get("tree_expansion_time_s", 0.0) for item in debug),
+            "tree_selection_time_s": sum(item.get("tree_selection_time_s", 0.0) for item in debug),
+            "tree_rebuild_time_s": sum(item.get("tree_rebuild_time_s", 0.0) for item in debug),
+            "tree_mask_build_time_s": sum(item.get("tree_mask_build_time_s", 0.0) for item in debug),
+            "opt_tree_overhead_s": sum(item.get("opt_tree_overhead_s", 0.0) for item in debug),
+            "selected_depth_histogram": dict(sorted(depth_hist.items(), key=lambda item: int(item[0]))),
+            "debug": debug,
         }
 
     @classmethod
